@@ -26,6 +26,7 @@
 #include "user_gpio.h"
 #include "user_power.h"
 #include "user_mqtt_client.h"
+#include "user_mqtt_client_app.h"
 
 typedef struct {
     char topic[MAX_MQTT_TOPIC_SIZE];
@@ -65,6 +66,9 @@ mico_timer_t timer_handle;
 static char timer_status = 0;
 
 void UserMqttTimerFunc(void *arg) {
+    if (!isconnect) {
+        return;
+    }
     LinkStatusTypeDef LinkStatus;
     micoWlanGetLinkStatus(&LinkStatus);
     if (LinkStatus.is_connected != 1) {
@@ -109,9 +113,9 @@ OSStatus UserMqttDeInit(void) {
 }
 
 void clear_mqtt_msg_send_queue(void) {
-if(mqtt_msg_send_queue == NULL){
-return;
-}
+    if(mqtt_msg_send_queue == NULL){
+        return;
+    }
     void *msg = NULL;
     while (mico_rtos_is_queue_empty(&mqtt_msg_send_queue) == false) {
         if (mico_rtos_pop_from_queue(&mqtt_msg_send_queue, &msg, 0) == kNoErr) {
@@ -123,8 +127,8 @@ return;
 /* Application entrance */
 OSStatus UserMqttInit(void) {
     OSStatus err = kNoErr;
-if(mqtt_msg_send_queue != NULL)
-    return err;
+    if(mqtt_msg_send_queue != NULL)
+        return err;
     sprintf(topic_set, MQTT_CLIENT_SUB_TOPIC1);
     sprintf(topic_state, MQTT_CLIENT_PUB_TOPIC, str_mac);
     //TODO size:0x800
@@ -219,8 +223,8 @@ static OSStatus MqttMsgPublish(Client *c, const char *topic, char qos, char reta
 }
 
 void registerMqttEvents(void) {
-if(timer_status !=0){
-    mico_stop_timer(&timer_handle);
+    if(timer_status !=0){
+        mico_stop_timer(&timer_handle);
     }
     timer_status = 0;
     mico_start_timer(&timer_handle);
@@ -258,28 +262,40 @@ void MqttClientThread(mico_thread_arg_t arg) {
     /* 1. create network connection */
     ssl_settings.ssl_enable = false;
     LinkStatusTypeDef LinkStatus;
+    int net_retry_count = 0;
     while (!mqtt_thread_should_exit) {
         isconnect = false;
-        mico_rtos_thread_sleep(3);
+        mico_rtos_thread_sleep(5);
         if (MQTT_SERVER[0] < 0x20 || MQTT_SERVER[0] > 0x7f || MQTT_SERVER_PORT < 1)
-            continue;  //鏈厤缃甿qtt鏈嶅姟鍣ㄦ椂涓嶈繛鎺�
+            continue;  //鏈厤缃甿qtt鏈嶅姟鍣ㄦ椂涓嶈繛鎺
 
         micoWlanGetLinkStatus(&LinkStatus);
         if (LinkStatus.is_connected != 1) { mqtt_log(
                     "ERROR:WIFI not connect, waiting 3s for connecting and then connecting MQTT ");
             mico_rtos_thread_sleep(3);
+            net_retry_count = 0;
             continue;
         }
 
         rc = NewNetwork(&n, MQTT_SERVER, MQTT_SERVER_PORT, ssl_settings);
         if (rc == MQTT_SUCCESS) break;
 
-        //mqtt_log("ERROR: MQTT network connect err=%d, reconnect after 3s...", rc);
+        // ★关键修复: NewNetwork失败后清理残留的socket fd，防止fd泄漏
+        if (n.disconnect) {
+            n.disconnect(&n);
+        }
+        mqtt_log("ERROR: MQTT network connect err=%d, retry %d", rc, net_retry_count);
+
+        // 递增重试间隔，最多等待30秒，减少断网时重连风暴的内存压力
+        net_retry_count++;
+        int backoff = net_retry_count > 6 ? 30 : (5 * net_retry_count);
+        mico_rtos_thread_sleep(backoff);
     }
     mqtt_log("MQTT network connect success!");
 
     /* 2. init mqtt client */
     //c.heartbeat_retry_max = 2;
+    c.heartbeat_retry_max = 20;
     rc = MQTTClientInit(&c, &n, MQTT_CMD_TIMEOUT);
     require_noerr_string(rc, MQTT_reconnect, "ERROR: MQTT client init err.");
 
@@ -363,19 +379,21 @@ void MqttClientThread(mico_thread_arg_t arg) {
 
     MQTT_reconnect:
 
-mqtt_log("Disconnect MQTT client, and reconnect after 5s, reason: mqtt_rc = %d, err = %d", rc, err);
+    isconnect = false; // ★关键: 先置为false，阻止其他线程继续往队列塞消息
+
+    mqtt_log("Disconnect MQTT client, and reconnect after 5s, reason: mqtt_rc = %d, err = %d", rc, err);
 
     timer_status = 100;
+    mico_stop_timer(&timer_handle);
     clear_mqtt_msg_send_queue();
     UserMqttClientRelease(&c, &n);
-    isconnect = false;
     UserLedSet(-1);
     mico_rtos_thread_msleep(100);
     UserLedSet(-1);
     mico_rtos_thread_sleep(5);
     goto MQTT_start;
 
-exit:
+    exit:
     isconnect = false;
     mqtt_log("EXIT: MQTT client exit with err = %d.", err);
     UserMqttClientRelease(&c, &n);
@@ -439,6 +457,8 @@ void ProcessHaCmd(char *cmd) {
         UserRelaySet(i, on);
         UserMqttSendSocketState(i);
         UserMqttSendTotalSocketState();
+        UserMqttSendSocketState2(i);
+        UserMqttSendTotalSocketState2();
         mico_system_context_update(sys_config);
     } else if (strcmp(cmd, "set led") == ' ') {
         int on;
@@ -451,6 +471,7 @@ void ProcessHaCmd(char *cmd) {
             UserLedSet(0);
         }
         UserMqttSendLedState();
+        UserMqttSendLedState2();
         mico_system_context_update(sys_config);
     } else if (strcmp(cmd, "set total_socket") == ' ') {
         int on;
@@ -461,8 +482,10 @@ void ProcessHaCmd(char *cmd) {
         for (i = 0; i < SOCKET_NUM; i++) {
             UserRelaySet(i, user_config->socket_status[i]);
             UserMqttSendSocketState(i);
+            UserMqttSendSocketState2(i);
         }
         UserMqttSendTotalSocketState();
+        UserMqttSendTotalSocketState2();
     }else if (strcmp(cmd, "set childLock") == ' ') {
         int on;
         sscanf(cmd, "set childLock %s %d", mac, &on);
@@ -470,6 +493,7 @@ void ProcessHaCmd(char *cmd) {
         user_config->user[0] = on;
         childLockEnabled = on;
         UserMqttSendChildLockState();
+        UserMqttSendChildLockState2();
         mico_system_context_update(sys_config);
     }else if (strcmp(cmd, "reboot") == ' ') {
         sscanf(cmd, "reboot %s", mac);
@@ -482,7 +506,7 @@ OSStatus UserMqttSendTopic(char *topic, char *arg, char retained) {
     OSStatus err = kUnknownErr;
     p_mqtt_send_msg_t p_send_msg = NULL;
     if(mqtt_msg_send_queue == NULL|| !isconnect){
-    return err;
+        return err;
     }
 
 //  mqtt_log("======App prepare to send ![%d]======", MicoGetMemoryInfo()->free_memory);
@@ -831,7 +855,7 @@ extern void UserMqttHassPower(void) {
     UserMqttSendTopic(topic_buf, send_buf, 0);
 
     sprintf(topic_buf, "homeassistant/sensor/%s/powerConsumption/state", str_mac);
-    sprintf(send_buf, "{\"powerConsumption\":\"%.3f\"}", (17.1 * p_count) / 1000 / 36000);
+    sprintf(send_buf, "{\"powerConsumption\":\"%.3f\"}", (BL0937 * p_count) / 1000 / 36000);
     UserMqttSendTopic(topic_buf, send_buf, 0);
 
     //计算系统运行时间
@@ -851,15 +875,15 @@ extern void UserMqttHassPower(void) {
 
 //    tc1_log("p_count %ld, p_count_1_day_ago %ld ,p_count_2_days_ago %ld, result %ld",p_count,user_config->p_count_1_day_ago,user_config->p_count_2_days_ago,((p_count-user_config->p_count_1_day_ago)<0?0:(p_count-user_config->p_count_1_day_ago)));
     sprintf(topic_buf, "homeassistant/sensor/%s/powerConsumptionToday/state", str_mac);
-    sprintf(send_buf, "{\"powerConsumptionToday\":\"%.3f\"}", (17.1 * ((p_count -
-                                                                        user_config->p_count_1_day_ago) <
-                                                                       0 ? 0 : (p_count -
-                                                                                user_config->p_count_1_day_ago))) /
+    sprintf(send_buf, "{\"powerConsumptionToday\":\"%.3f\"}", (BL0937 * ((p_count -
+                                                                          user_config->p_count_1_day_ago) <
+                                                                         0 ? 0 : (p_count -
+                                                                                  user_config->p_count_1_day_ago))) /
                                                               1000 / 36000);
     UserMqttSendTopic(topic_buf, send_buf, 0);
 
     sprintf(topic_buf, "homeassistant/sensor/%s/powerConsumptionYesterday/state", str_mac);
-    sprintf(send_buf, "{\"powerConsumptionYesterday\":\"%.3f\"}", (17.1 *
+    sprintf(send_buf, "{\"powerConsumptionYesterday\":\"%.3f\"}", (BL0937 *
                                                                    ((user_config->p_count_1_day_ago -
                                                                      user_config->p_count_2_days_ago) <
                                                                     0 ? 0 : (

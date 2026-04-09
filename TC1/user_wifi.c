@@ -70,6 +70,7 @@ void WifiScanCallback(ScanResult_adv* scan_ret, void* arg)
     wifi_log("wifi_scan_callback ApNum[%d] ApList[0](%s)", count, scan_ret->ApList[0].ssid);
 
     int i = 0;
+    if (wifi_ret) { free(wifi_ret); wifi_ret = NULL; }
     wifi_ret = malloc(sizeof(char)*count * (32 + 2) + 50);
     char* ssids = malloc(sizeof(char)*count * 32);
     char* secs = malloc(sizeof(char)*count * 2 + 1);
@@ -123,9 +124,11 @@ static void WifiLedTimerCallback(void* arg)
             UserLedSet(-1);
             break;
         case WIFI_STATE_CONNECTED:
-            if (!(MQTT_SERVER[0] < 0x20 || MQTT_SERVER[0] > 0x7f || MQTT_SERVER_PORT < 1)){
-                UserMqttInit();
-            }
+        wifi_log("wifi connected!!");
+     if (!(MQTT_SERVER[0] < 0x20 || MQTT_SERVER[0] > 0x7f || MQTT_SERVER_PORT < 1)){
+          UserMqttInit();
+           }
+
             UserLedSet(0);
             mico_rtos_stop_timer(&wifi_led_timer);
             if (RelayOut()&&user_config->power_led_enabled)

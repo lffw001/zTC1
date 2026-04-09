@@ -10,7 +10,9 @@
 #include "user_wifi.h"
 #include "time_server/user_rtc.h"
 #include "user_power.h"
+#include "mqtt_server/user_mqtt_client.h"
 #include "http_server/app_httpd.h"
+#include "udp_server/udp_server.h"
 #include "timed_task/timed_task.h"
 
 char rtc_init = 0; //sntp校时成功标志位
@@ -112,7 +114,9 @@ void schedule_p_count_task(mico_thread_arg_t arg) {
 
 void reportMqttPowerInfoThread() {
     while (1) {
-        UserMqttHassPower();
+        if (UserMqttIsConnect()) {
+            UserMqttHassPower();
+        }
         int freq = user_config->mqtt_report_freq;
 
         if (freq == 0) {
@@ -189,7 +193,10 @@ int application_start(void) {
     require_noerr(err, exit);
     PowerInit();
     AppHttpdStart(); // start http server thread
-
+//    udp_server_start();
+//if (!(MQTT_SERVER[0] < 0x20 || MQTT_SERVER[0] > 0x7f || MQTT_SERVER_PORT < 1)){
+//      UserMqttInit();
+//            }
     UserLedSet(user_config->power_led_enabled);
 
     err = mico_rtos_create_thread(NULL, MICO_APPLICATION_PRIORITY, "p_count",
